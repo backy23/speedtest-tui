@@ -2,6 +2,14 @@
 
 A Python-based command-line interface for testing internet speed using Ookla's Speedtest.net servers. This client provides advanced metrics often hidden in the standard web interface.
 
+## Screenshots
+
+![Server Selection](LINK_TO_YOUR_UPLOADED_IMAGE_1)
+*Server selection and ping test*
+
+![Download Test](LINK_TO_YOUR_UPLOADED_IMAGE_2)
+*Download speed measurement*
+
 ## Features
 
 - **Detailed Latency**: Measures jitter and provides a histogram of ping times using WebSocket protocol.

@@ -47,3 +47,7 @@ cover/
 *.har
 *.csv
 *.log
+
+# Images (External hosting)
+*.jpg
+*.png
