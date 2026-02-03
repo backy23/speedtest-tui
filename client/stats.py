@@ -78,13 +78,14 @@ class ConnectionStats:
     bytes_transferred: int = 0
     duration_ms: float = 0.0
     speed_mbps: float = 0.0
+    speed_samples: List[float] = field(default_factory=list)  # Per-connection speed samples for aggregation
     
     def calculate(self):
         if self.duration_ms > 0:
             self.speed_mbps = (self.bytes_transferred * 8) / (self.duration_ms / 1000) / 1_000_000
     
     def to_dict(self) -> dict:
-        return {
+        result = {
             "id": self.id,
             "server_id": self.server_id,
             "hostname": self.hostname,
@@ -92,6 +93,10 @@ class ConnectionStats:
             "duration_ms": round(self.duration_ms, 2),
             "speed_mbps": round(self.speed_mbps, 2)
         }
+        # Only include speed_samples if non-empty
+        if self.speed_samples:
+            result["speed_samples"] = [round(s, 2) for s in self.speed_samples]
+        return result
 
 
 def calculate_jitter(samples: List[float]) -> float:

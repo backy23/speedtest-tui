@@ -207,21 +207,33 @@ class ProgressDisplay:
             console=console
         )
         self.task_id = None
+        self._last_speed = 0.0  # Track last speed to reduce flicker
+        self._last_progress = 0.0  # Track last progress to reduce updates
     
     def start(self, description: str):
         """Start progress display."""
         self.progress.start()
         self.task_id = self.progress.add_task(description, total=100, speed="")
+        self._last_speed = 0.0
+        self._last_progress = 0.0
     
     def update(self, progress: float, speed_mbps: float = 0):
-        """Update progress."""
+        """Update progress with debouncing to reduce flicker."""
         if self.task_id is not None:
-            speed_str = format_speed(speed_mbps) if speed_mbps > 0 else ""
-            self.progress.update(
-                self.task_id,
-                completed=progress * 100,
-                speed=speed_str
-            )
+            # Only update if progress or speed changed significantly
+            # This reduces UI updates and prevents flickering
+            progress_changed = abs(progress - self._last_progress) >= 0.01  # 1% change
+            speed_changed = abs(speed_mbps - self._last_speed) >= 1.0  # 1 Mbps change
+            
+            if progress_changed or speed_changed:
+                speed_str = format_speed(speed_mbps) if speed_mbps > 0 else "..."
+                self.progress.update(
+                    self.task_id,
+                    completed=progress * 100,
+                    speed=speed_str
+                )
+                self._last_progress = progress
+                self._last_speed = speed_mbps
     
     def stop(self):
         """Stop progress display."""
