@@ -288,20 +288,8 @@ class UploadTester:
         result.bytes_total = bytes_uploaded[0]  # Read from shared list
         result.connections = connection_stats  # Use shared list populated by workers
         
-        # Calculate overall speed from per-connection samples
-        # This provides more accurate aggregate speed measurement
-        all_speed_samples = []
-        for conn in connection_stats:
-            all_speed_samples.extend(conn.speed_samples)
-        
-        if all_speed_samples:
-            result.samples = all_speed_samples
-            # Calculate average speed from all per-connection measurements
-            avg_speed = sum(all_speed_samples) / len(all_speed_samples)
-            result.speed_bps = avg_speed * 1_000_000
-            result.speed_mbps = avg_speed
-        else:
-            result.samples = speed_samples
-            result.calculate()
+        # Use aggregate speed samples for consistent display (like download)
+        result.samples = speed_samples
+        result.calculate()
         
         return result
