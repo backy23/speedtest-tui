@@ -4,10 +4,10 @@ A Python-based command-line interface for testing internet speed using Ookla's S
 
 ## Screenshots
 
-![Server Selection](LINK_TO_YOUR_UPLOADED_IMAGE_1)
+![Server Selection](https://github.com/user-attachments/assets/1200757f-a133-4700-a303-644f455b1bb3)
 *Server selection and ping test*
 
-![Download Test](LINK_TO_YOUR_UPLOADED_IMAGE_2)
+![Download Test](https://github.com/user-attachments/assets/1c61e38d-522d-4731-9e92-0e30df48bb8f)
 *Download speed measurement*
 
 ## Features
