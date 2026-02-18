@@ -221,6 +221,12 @@ class DownloadTester:
             workers = [asyncio.create_task(_worker(session, i)) for i in range(connections)]
             sampler = asyncio.create_task(_sampler())
 
+            # Loaded latency (bufferbloat detection)
+            from .latency import measure_loaded_latency
+            latency_task = asyncio.create_task(
+                measure_loaded_latency(server, stop, interval=1.0)
+            )
+
             remaining = end_time - time.perf_counter()
             if remaining > 0:
                 await asyncio.sleep(remaining)
@@ -230,11 +236,21 @@ class DownloadTester:
             for t in workers:
                 t.cancel()
             sampler.cancel()
+            latency_task.cancel()
 
             await asyncio.gather(*workers, return_exceptions=True)
+            for task in (sampler, latency_task):
+                try:
+                    await task
+                except (asyncio.CancelledError, RuntimeError):
+                    pass
+
+            # Collect loaded latency results
             try:
-                await sampler
-            except (asyncio.CancelledError, RuntimeError):
+                loaded_lat = latency_task.result()
+                if loaded_lat and loaded_lat.count > 0:
+                    result.loaded_latency = loaded_lat
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
                 pass
 
         result.duration_ms = (time.perf_counter() - start_time) * 1000

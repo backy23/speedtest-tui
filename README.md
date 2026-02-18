@@ -12,10 +12,13 @@ A Python-based command-line interface for testing internet speed using Ookla's S
 
 ## Features
 
-- **Detailed Latency**: Measures jitter and provides a histogram of ping times using WebSocket protocol.
-- **Parallel Testing**: Uses multiple concurrent connections for download and upload synchronization.
+- **Detailed Latency**: Measures jitter, packet loss, and provides a histogram of ping times using WebSocket protocol.
+- **Loaded Latency (Bufferbloat)**: Measures ping during download and upload to detect bufferbloat.
+- **Parallel Testing**: Uses multiple concurrent connections for download and upload with warm-up discard and IQM-based speed calculation.
 - **Rich Interface**: Beautiful terminal dashboard using the `rich` library.
+- **Test History**: Automatically saves results with sparkline trend charts (`--history`).
 - **JSON Export**: Full data export for automation and logging.
+- **CSV Logging**: Append results to a CSV file for long-term monitoring (`--csv`).
 
 ## Installation
 
@@ -45,10 +48,40 @@ Run the speedtest:
 python speedtest.py
 ```
 
-Options:
-- `--simple`: Text-only output (no dashboard)
-- `--json`: Output JSON data
-- `--output FILE`: Save JSON to file
-- `--ping-count N`: Number of ping samples
-- `--download-duration SECS`: Duration of download test
-- `--upload-duration SECS`: Duration of upload test
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `--simple`, `-s` | Text-only output (no dashboard) |
+| `--json`, `-j` | Output JSON data |
+| `--output FILE`, `-o` | Save JSON to file |
+| `--csv FILE` | Append result as CSV row |
+| `--history` | Show past test results with sparkline trends |
+| `--list-servers` | List available servers and exit |
+| `--server ID` | Use a specific server by ID |
+| `--ping-count N` | Number of ping samples (default: 10) |
+| `--download-duration SECS` | Duration of download test (default: 10) |
+| `--upload-duration SECS` | Duration of upload test (default: 10) |
+| `--connections N` | Number of concurrent connections (default: 4) |
+
+### Examples
+
+```bash
+# Simple text output
+python speedtest.py --simple
+
+# Save to JSON and CSV
+python speedtest.py -o result.json --csv speedlog.csv
+
+# View test history with trend charts
+python speedtest.py --history
+
+# Use a specific server with more pings
+python speedtest.py --server 12345 --ping-count 20
+```
+
+## Running Tests
+
+```bash
+python -m unittest discover -s tests -v
+```

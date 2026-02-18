@@ -108,7 +108,8 @@ def print_latency_details(result) -> None:  # noqa: ANN001 (ServerLatencyResult)
     table.add_row("Mean", format_latency(statistics.mean(pings)))
     table.add_row("Median", format_latency(statistics.median(pings)))
     table.add_row("Jitter", f"{result.jitter_ms:.2f} ms")
-    table.add_row("Samples", str(len(pings)))
+    table.add_row("Packet Loss", f"{result.packet_loss:.1f}%")
+    table.add_row("Samples", f"{len(pings)}/{result.ping_attempts}")
     console.print(table)
 
     console.print(
@@ -130,6 +131,12 @@ def print_speed_result(result, title: str, color: str = "green") -> None:  # noq
     table.add_row("Data Transferred", f"{result.bytes_total / 1_000_000:.1f} MB")
     table.add_row("Duration", f"{result.duration_ms / 1000:.1f} s")
     table.add_row("Connections", str(len(result.connections)))
+
+    # Loaded latency (bufferbloat)
+    if result.loaded_latency and result.loaded_latency.count > 0:
+        ll = result.loaded_latency
+        table.add_row("Loaded Latency", f"{ll.mean:.1f} ms [dim](jitter: {ll.jitter:.2f} ms)[/dim]")
+
     console.print(table)
 
     if result.samples:
@@ -165,20 +172,76 @@ def print_final_results(
     upload_mbps: float,
     server_name: str,
     server_sponsor: str,
+    packet_loss: float = 0.0,
+    dl_loaded_latency: float = 0.0,
+    ul_loaded_latency: float = 0.0,
 ) -> None:
+    lines = [
+        f"[bold cyan]Server:[/bold cyan] {server_name} ({server_sponsor})\n",
+        f"[bold white]   Ping:[/bold white]  [bold yellow]{ping_ms:.1f} ms[/bold yellow]  "
+        f"[dim](jitter: {jitter_ms:.2f} ms)[/dim]",
+    ]
+    if packet_loss > 0:
+        lines.append(f"[bold white]   Packet Loss:[/bold white]  [bold red]{packet_loss:.1f}%[/bold red]")
+    lines.append(f"[bold white]   Download:[/bold white]  [bold green]{format_speed(download_mbps)}[/bold green]")
+    if dl_loaded_latency > 0:
+        lines.append(f"[dim]      Loaded latency: {dl_loaded_latency:.1f} ms[/dim]")
+    lines.append(f"[bold white]   Upload:[/bold white]  [bold blue]{format_speed(upload_mbps)}[/bold blue]")
+    if ul_loaded_latency > 0:
+        lines.append(f"[dim]      Loaded latency: {ul_loaded_latency:.1f} ms[/dim]")
+
     console.print()
     console.print(
         Panel.fit(
-            f"[bold cyan]Server:[/bold cyan] {server_name} ({server_sponsor})\n\n"
-            f"[bold white]   Ping:[/bold white]  [bold yellow]{ping_ms:.1f} ms[/bold yellow]  "
-            f"[dim](jitter: {jitter_ms:.2f} ms)[/dim]\n"
-            f"[bold white]   Download:[/bold white]  [bold green]{format_speed(download_mbps)}[/bold green]\n"
-            f"[bold white]   Upload:[/bold white]  [bold blue]{format_speed(upload_mbps)}[/bold blue]",
+            "\n".join(lines),
             title="[bold]Results[/bold]",
             border_style="cyan",
         )
     )
     console.print()
+
+
+def print_history(entries: List[dict]) -> None:
+    """Print a history table with sparkline trends."""
+    from client.history import format_history_table, sparkline
+
+    rows = format_history_table(entries)
+    if not rows:
+        console.print("[dim]No history found. Run a test first.[/dim]")
+        return
+
+    table = Table(title="Test History", box=box.ROUNDED)
+    table.add_column("Date", style="dim")
+    table.add_column("Server")
+    table.add_column("Ping", justify="right")
+    table.add_column("Download", justify="right")
+    table.add_column("Upload", justify="right")
+
+    for r in rows:
+        table.add_row(
+            r["timestamp"],
+            r["server"][:35],
+            f"{r['ping']:.1f} ms",
+            format_speed(r["download"]),
+            format_speed(r["upload"]),
+        )
+
+    console.print(table)
+
+    # Sparkline trends
+    dl_values = [r["download"] for r in rows if r["download"] > 0]
+    ul_values = [r["upload"] for r in rows if r["upload"] > 0]
+    ping_values = [r["ping"] for r in rows if r["ping"] > 0]
+
+    if dl_values:
+        console.print(f"  [green]Download trend:[/green] {sparkline(dl_values)}  "
+                       f"[dim]{min(dl_values):.0f}-{max(dl_values):.0f} Mbps[/dim]")
+    if ul_values:
+        console.print(f"  [blue]Upload trend:[/blue]   {sparkline(ul_values)}  "
+                       f"[dim]{min(ul_values):.0f}-{max(ul_values):.0f} Mbps[/dim]")
+    if ping_values:
+        console.print(f"  [yellow]Ping trend:[/yellow]     {sparkline(ping_values)}  "
+                       f"[dim]{min(ping_values):.0f}-{max(ping_values):.0f} ms[/dim]")
 
 
 # ---------------------------------------------------------------------------

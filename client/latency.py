@@ -61,15 +61,20 @@ class ServerLatencyResult:
     pings: List[float] = field(default_factory=list)
     latency_ms: float = 0.0     # best (min) latency
     jitter_ms: float = 0.0
+    packet_loss: float = 0.0    # percentage 0-100
+    ping_attempts: int = 0      # total pings attempted
     success: bool = True
     error: Optional[str] = None
     server_version: str = ""
 
     def calculate(self) -> None:
-        """Derive min-latency and jitter from collected pings."""
+        """Derive min-latency, jitter, and packet loss from collected pings."""
         if self.pings:
             self.latency_ms = min(self.pings)
             self.jitter_ms = calculate_jitter(self.pings)
+        if self.ping_attempts > 0:
+            lost = self.ping_attempts - len(self.pings)
+            self.packet_loss = (lost / self.ping_attempts) * 100
 
     def to_dict(self) -> dict:
         return {
@@ -80,6 +85,7 @@ class ServerLatencyResult:
             "pings": [round(p, 1) for p in self.pings],
             "latency_ms": round(self.latency_ms, 1),
             "jitter_ms": round(self.jitter_ms, 3),
+            "packet_loss": round(self.packet_loss, 1),
             "success": self.success,
             "server_version": self.server_version,
         }
@@ -104,6 +110,7 @@ class LatencyTester:
 
     async def test_server(self, server: Server) -> ServerLatencyResult:
         result = ServerLatencyResult(server=server)
+        attempts = 0
 
         try:
             async with websockets.connect(
@@ -116,17 +123,20 @@ class LatencyTester:
                 await self._read_handshake(ws, result)
 
                 for _ in range(self.ping_count):
+                    attempts += 1
                     pr = await self._ping_once(ws)
                     if pr.success:
                         result.pings.append(pr.latency_ms)
                     else:
                         # One failure is tolerated; two in a row means stop.
+                        attempts += 1
                         pr2 = await self._ping_once(ws)
                         if pr2.success:
                             result.pings.append(pr2.latency_ms)
                         else:
                             break
 
+                result.ping_attempts = attempts
                 result.calculate()
 
         except asyncio.TimeoutError:
@@ -219,3 +229,70 @@ class LatencyTester:
                 client_timestamp=send_time,
                 error="Ping timeout",
             )
+
+
+# ---------------------------------------------------------------------------
+# Loaded latency helper (bufferbloat detection)
+# ---------------------------------------------------------------------------
+
+async def measure_loaded_latency(
+    server: Server,
+    stop: asyncio.Event,
+    interval: float = 1.0,
+) -> LatencyStats:
+    """
+    Measure latency while the network is under load.
+
+    Call this as a concurrent task alongside download/upload workers.
+    It opens its own WebSocket, sends periodic PINGs, and collects
+    round-trip times until *stop* is set.  Returns a ``LatencyStats``
+    with the results.
+    """
+    from .stats import LatencyStats as LS  # avoid circular at module level
+
+    samples: List[float] = []
+
+    try:
+        async with websockets.connect(
+            server.ws_url,
+            additional_headers=COMMON_HEADERS,
+            ping_interval=None,
+            close_timeout=2,
+            open_timeout=_WS_CONNECT_TIMEOUT,
+        ) as ws:
+            # Consume handshake
+            for _ in range(3):
+                try:
+                    await asyncio.wait_for(ws.recv(), timeout=_MSG_TIMEOUT)
+                except (asyncio.TimeoutError, Exception):
+                    break
+
+            while not stop.is_set():
+                send_time = time.perf_counter() * 1000
+                try:
+                    await ws.send(f"PING {send_time}")
+                    msg = await asyncio.wait_for(ws.recv(), timeout=_PING_TIMEOUT)
+                    recv_time = time.perf_counter() * 1000
+
+                    if msg.startswith("PONG"):
+                        samples.append(recv_time - send_time)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    break
+                except (websockets.exceptions.WebSocketException, ConnectionError, OSError):
+                    break
+
+                # Wait for next interval or stop
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=interval)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        pass
+    except (websockets.exceptions.WebSocketException, ConnectionError, OSError):
+        pass
+
+    stats = LS(samples=samples)
+    stats.calculate()
+    return stats
