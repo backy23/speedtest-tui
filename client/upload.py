@@ -1,29 +1,56 @@
 """
 Upload speed test module.
-Uses HTTPS POST to measure upload speed.
+Uses parallel HTTPS POST streaming to measure upload speed.
+
+Key design decisions for accurate measurement:
+- A shared aiohttp session avoids per-worker connection overhead.
+- Bytes are counted as they are yielded to the async generator; aiohttp
+  applies TCP back-pressure so yielded bytes closely match bytes on the wire.
+- The first WARMUP_SECONDS of speed samples are discarded to ignore TCP
+  slow-start and TLS negotiation noise.
+- The final reported speed uses the interquartile mean (IQM) of the
+  remaining samples, which is resistant to outlier spikes.
+- The UI callback receives an exponentially-smoothed speed value to avoid
+  visual flicker.
 """
 import asyncio
-import time
 import os
-import aiohttp
+import statistics
+import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Callable
+from typing import Callable, List, Optional
+
+import aiohttp
+
 from .api import Server
 from .stats import ConnectionStats, LatencyStats
 
+# ---------------------------------------------------------------------------
+# Tuning constants
+# ---------------------------------------------------------------------------
 
-# Constants for upload testing
-UPLOAD_CHUNK_SIZE = 256 * 1024  # 256KB chunks for better TCP window utilization
-UPLOAD_BUFFER_SIZE = 1024 * 1024  # 1MB buffer for pre-generated data
-SAMPLE_INTERVAL = 0.1  # 100ms sampling interval for accurate jitter calculation
-MAX_CONNECTIONS = 32  # Maximum allowed concurrent connections
-MIN_CONNECTIONS = 1   # Minimum allowed concurrent connections
-YIELD_CHECK_INTERVAL = 256 * 1024  # Yield control every 256KB transferred
-MIN_SAMPLE_ELAPSED = 0.05  # Minimum elapsed time (50ms) to avoid division by tiny values
-MAX_REASONABLE_SPEED = 20000.0  # Maximum reasonable speed in Mbps to filter spikes (20 Gbps)
-SPEED_SMOOTHING_FACTOR = 0.3  # Exponential moving average smoothing factor (30% new, 70% old)
-MIN_WORKER_SPEED_SAMPLES = 3  # Minimum samples before using worker speed
+# Data generation
+UPLOAD_CHUNK_SIZE = 256 * 1024        # 256 KB per yield – good for TCP window fill
+UPLOAD_BUFFER_SIZE = 1024 * 1024      # 1 MB pre-generated random buffer
 
+# Sampling
+SAMPLE_INTERVAL = 0.25                # 250 ms – long enough for stable readings
+WARMUP_SECONDS = 2.0                  # Discard samples during TCP slow-start
+
+# Connections
+MAX_CONNECTIONS = 32
+MIN_CONNECTIONS = 1
+
+# Speed filtering
+MAX_REASONABLE_SPEED = 20_000.0       # 20 Gbps – anything above is a spike
+
+# UI smoothing (exponential moving average)
+EMA_ALPHA = 0.25                      # 25 % new value, 75 % previous
+
+
+# ---------------------------------------------------------------------------
+# Result dataclass
+# ---------------------------------------------------------------------------
 
 @dataclass
 class UploadResult:
@@ -35,13 +62,29 @@ class UploadResult:
     connections: List[ConnectionStats] = field(default_factory=list)
     loaded_latency: Optional[LatencyStats] = None
     samples: List[float] = field(default_factory=list)
-    
+
     def calculate(self):
-        """Calculate final speed."""
+        """Derive speed from total bytes and wall-clock duration."""
         if self.duration_ms > 0:
             self.speed_bps = (self.bytes_total * 8) / (self.duration_ms / 1000)
             self.speed_mbps = self.speed_bps / 1_000_000
-    
+
+    def calculate_from_samples(self):
+        """
+        Derive speed from the interquartile mean of collected samples.
+
+        This is more accurate than total/duration because it filters out
+        warm-up ramp and cool-down artefacts.
+        """
+        if not self.samples:
+            self.calculate()
+            return
+
+        trimmed = _iqm_samples(self.samples)
+        if trimmed > 0:
+            self.speed_mbps = trimmed
+            self.speed_bps = trimmed * 1_000_000
+
     def to_dict(self) -> dict:
         result = {
             "speed_bps": round(self.speed_bps, 2),
@@ -49,247 +92,240 @@ class UploadResult:
             "bytes_total": self.bytes_total,
             "duration_ms": round(self.duration_ms, 2),
             "connections": [c.to_dict() for c in self.connections],
-            "samples": [round(s, 2) for s in self.samples]
+            "samples": [round(s, 2) for s in self.samples],
         }
         if self.loaded_latency:
             result["loaded_latency"] = self.loaded_latency.to_dict()
         return result
 
 
+# ---------------------------------------------------------------------------
+# Helper: interquartile mean
+# ---------------------------------------------------------------------------
+
+def _iqm_samples(samples: List[float]) -> float:
+    """Return the interquartile mean of *samples*, or plain mean if < 4."""
+    if not samples:
+        return 0.0
+    if len(samples) < 4:
+        return statistics.mean(samples)
+
+    ordered = sorted(samples)
+    n = len(ordered)
+    q1 = n // 4
+    q3 = (3 * n) // 4
+    middle = ordered[q1:q3]
+    return statistics.mean(middle) if middle else statistics.mean(samples)
+
+
+# ---------------------------------------------------------------------------
+# Tester
+# ---------------------------------------------------------------------------
+
 class UploadTester:
     """
-    Upload speed tester using HTTPS POST with infinite streaming.
-    Ensures test runs exactly for duration_seconds.
+    Upload speed tester using parallel HTTPS POST streams.
+
+    Each worker opens a long-running streaming POST to the server.
+    A shared ``aiohttp.ClientSession`` is used for connection pooling.
+    Speed is sampled every ``SAMPLE_INTERVAL`` seconds; the first
+    ``WARMUP_SECONDS`` of samples are discarded to avoid TCP slow-start
+    noise.  The final speed is the interquartile mean of the remaining
+    samples.
     """
-    
+
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+        ),
         "Content-Type": "application/octet-stream",
         "Origin": "https://www.speedtest.net",
         "Referer": "https://www.speedtest.net/",
     }
-    
+
     def __init__(self, duration_seconds: float = 15.0):
         self.duration_seconds = duration_seconds
-        # Pre-generate larger buffer for better performance
-        self._data_buffer = os.urandom(UPLOAD_BUFFER_SIZE)  # 1MB buffer
-        self._chunk_size = UPLOAD_CHUNK_SIZE
+        self._data_buffer = os.urandom(UPLOAD_BUFFER_SIZE)
         self.on_progress: Optional[Callable[[float, float], None]] = None
-    
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
     async def test(self, server: Server, connections: int = 4) -> UploadResult:
-        """Perform upload speed test."""
-        # Validate connection count
+        """Run the upload speed test and return an ``UploadResult``."""
         connections = max(MIN_CONNECTIONS, min(connections, MAX_CONNECTIONS))
-        
+
         result = UploadResult()
-        
-        # Use a list to make bytes_uploaded mutable and shareable across tasks
-        bytes_uploaded = [0]  # Wrap in list for proper sharing between coroutines
-        speed_samples = []
-        connection_stats = []  # Shared list to collect connection stats
+
+        # Shared mutable state -------------------------------------------
+        total_bytes = 0                  # written by workers only
+        speed_samples: List[float] = []  # written by sampler only
+        conn_stats: List[ConnectionStats] = []
+
         start_time = time.perf_counter()
         end_time = start_time + self.duration_seconds
-        stop_flag = asyncio.Event()
-        
-        async def upload_worker(conn_id: int) -> ConnectionStats:
-            # Track per-connection data to eliminate race conditions
-            conn_bytes_uploaded = 0
-            conn_last_bytes = 0
-            conn_last_time = start_time
-            conn_speed_samples = []  # Per-connection speed samples
-            conn_sample_count = 0
-            
+        stop = asyncio.Event()
+
+        # ----------------------------------------------------------------
+        # Worker coroutine
+        # ----------------------------------------------------------------
+        async def _worker(
+            session: aiohttp.ClientSession,
+            conn_id: int,
+        ) -> None:
+            nonlocal total_bytes
+
             stats = ConnectionStats(
                 id=conn_id,
                 server_id=server.id,
-                hostname=server.hostname
+                hostname=server.hostname,
             )
-            
-            # Add to shared list for final collection
-            connection_stats.append(stats)
-            
-            conn_start = time.perf_counter()
-            timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_read=5)
-            
-            # Track position in buffer for cycling through data
-            buffer_pos = 0
-            buffer_size = len(self._data_buffer)
-            bytes_since_yield = 0  # Track bytes since last yield for efficiency
-            
-            # Async generator that yields data until stop_flag is set
-            async def data_stream():
-                nonlocal conn_bytes_uploaded, conn_last_bytes, conn_last_time, conn_speed_samples, conn_sample_count, buffer_pos, bytes_since_yield
-                
-                while not stop_flag.is_set() and time.perf_counter() < end_time:
-                    # Get chunk from buffer (cycle through if needed)
-                    chunk_end = buffer_pos + self._chunk_size
-                    if chunk_end > buffer_size:
-                        # Need to wrap around, yield two chunks
-                        # Use memoryview for zero-copy when possible
-                        first_part = self._data_buffer[buffer_pos:]
-                        second_part = self._data_buffer[:chunk_end - buffer_size]
-                        chunk = first_part + second_part
-                        buffer_pos = chunk_end - buffer_size
+            conn_stats.append(stats)
+            worker_start = time.perf_counter()
+            buf = self._data_buffer
+            buf_len = len(buf)
+
+            async def _data_stream():
+                nonlocal total_bytes
+                pos = 0
+                while not stop.is_set() and time.perf_counter() < end_time:
+                    # Slice a chunk out of the pre-generated buffer
+                    end_pos = pos + UPLOAD_CHUNK_SIZE
+                    if end_pos <= buf_len:
+                        chunk = buf[pos:end_pos]
+                        pos = end_pos
                     else:
-                        chunk = self._data_buffer[buffer_pos:chunk_end]
-                        buffer_pos = chunk_end
-                    
+                        chunk = buf[pos:] + buf[: end_pos - buf_len]
+                        pos = end_pos - buf_len
+
                     chunk_len = len(chunk)
                     stats.bytes_transferred += chunk_len
-                    conn_bytes_uploaded += chunk_len
-                    bytes_since_yield += chunk_len
-                    # Update shared bytes counter for progress tracking
-                    bytes_uploaded[0] += chunk_len
-                    
-                    # Sample per-connection speed periodically
-                    current_time = time.perf_counter()
-                    elapsed = current_time - conn_last_time
-                    if elapsed >= MIN_SAMPLE_ELAPSED and conn_bytes_uploaded > conn_last_bytes:
-                        conn_speed = ((conn_bytes_uploaded - conn_last_bytes) * 8) / elapsed / 1_000_000
-                        if conn_speed < MAX_REASONABLE_SPEED or conn_sample_count >= MIN_WORKER_SPEED_SAMPLES:
-                            conn_speed_samples.append(conn_speed)
-                        conn_last_bytes = conn_bytes_uploaded
-                        conn_last_time = current_time
-                        conn_sample_count += 1
-                    
-                    # Yield control to event loop periodically for better responsiveness
-                    # Use counter instead of modulo for efficiency
-                    if bytes_since_yield >= YIELD_CHECK_INTERVAL:
-                        bytes_since_yield = 0
-                        await asyncio.sleep(0)
-                    
+                    total_bytes += chunk_len
                     yield chunk
-                        
-            try:
-                # Use connection pooling with force_close=False for better performance
-                connector = aiohttp.TCPConnector(
-                    ssl=True,
-                    force_close=False,
-                    limit=1,
-                    limit_per_host=1,
-                    enable_cleanup_closed=True
-                )
-                async with aiohttp.ClientSession(
-                    headers=self.HEADERS,
-                    connector=connector,
-                    timeout=timeout
-                ) as session:
-                    # We create a new POST request whenever the previous one finishes (unlikely if streaming works right)
-                    # or just run one long streaming POST.
-                    while not stop_flag.is_set() and time.perf_counter() < end_time:
-                        try:
-                            # Use chunked encoding implicitly by passing async generator
-                            async with session.post(
-                                server.upload_url,
-                                data=data_stream()
-                            ) as response:
-                                await response.read()
-                        except asyncio.CancelledError:
-                            break
-                        except (aiohttp.ClientError, OSError) as e:
-                            # If connection breaks, retry if time permits
-                            if stop_flag.is_set():
-                                break
-                            await asyncio.sleep(0.1)
-                            
-            except asyncio.CancelledError:
-                pass
-            except (aiohttp.ClientError, OSError) as e:
-                # Connection-level error, stats will be incomplete
-                pass
-            
-            stats.duration_ms = (time.perf_counter() - conn_start) * 1000
-            stats.calculate()
-            
-            # Store per-connection speed samples in stats for later aggregation
-            stats.speed_samples = conn_speed_samples
-            
-            return stats
-        
-        async def sample_speed():
-            nonlocal bytes_uploaded
-            last_bytes = 0
-            last_time = start_time
-            last_smoothed_speed = 0.0  # Track smoothed speed for UI display
-            speed_mbps = 0.0  # Initialize to prevent UnboundLocalError
-            first_sample = True  # Track first sample to avoid initial spikes
-            smoothed_speed = 0.0  # Initialize smoothed_speed
-            
-            while not stop_flag.is_set() and time.perf_counter() < end_time:
+
+                    # Yield to the event loop periodically so the sampler
+                    # and stop-flag can run.
+                    await asyncio.sleep(0)
+
+            # Retry loop – reconnect if the server closes the POST early
+            while not stop.is_set() and time.perf_counter() < end_time:
                 try:
-                    await asyncio.wait_for(stop_flag.wait(), timeout=SAMPLE_INTERVAL)
+                    async with session.post(
+                        server.upload_url,
+                        data=_data_stream(),
+                    ) as resp:
+                        await resp.read()
+                except asyncio.CancelledError:
+                    break
+                except (aiohttp.ClientError, OSError):
+                    if stop.is_set():
+                        break
+                    await asyncio.sleep(0.2)
+
+            stats.duration_ms = (time.perf_counter() - worker_start) * 1000
+            stats.calculate()
+
+        # ----------------------------------------------------------------
+        # Sampler coroutine
+        # ----------------------------------------------------------------
+        async def _sampler() -> None:
+            prev_bytes = 0
+            prev_time = start_time
+            smoothed: float = 0.0
+
+            while not stop.is_set() and time.perf_counter() < end_time:
+                try:
+                    await asyncio.wait_for(
+                        stop.wait(), timeout=SAMPLE_INTERVAL,
+                    )
+                    break  # stop was set
                 except asyncio.TimeoutError:
                     pass
-                
-                current_time = time.perf_counter()
-                current_bytes = bytes_uploaded[0]  # Read from shared list
-                
-                elapsed = current_time - last_time
-                
-                # Only calculate speed if we have valid data and sufficient time has passed
-                # This prevents spikes from race conditions during connection startup
-                if elapsed >= MIN_SAMPLE_ELAPSED and current_bytes > last_bytes:
-                    speed_mbps = ((current_bytes - last_bytes) * 8) / elapsed / 1_000_000
-                    
-                    # Filter out unrealistic spikes (e.g., > 200 Mbps on 50 Mbps connection)
-                    # This handles transient measurement anomalies
-                    if speed_mbps < MAX_REASONABLE_SPEED or not first_sample:
-                        speed_samples.append(speed_mbps)
-                    
-                    first_sample = False  # After first valid sample, disable spike filter
-                
-                last_bytes = current_bytes
-                last_time = current_time
-                
-                # Calculate smoothed speed using exponential moving average
-                # This reduces oscillations while maintaining responsiveness
-                if speed_mbps > 0:  # Only update if we have valid speed
-                    if last_smoothed_speed == 0.0:
-                        # First valid speed, use directly
-                        smoothed_speed = speed_mbps if speed_mbps < MAX_REASONABLE_SPEED else 0.0
-                    else:
-                        # Apply exponential smoothing: 30% new, 70% old
-                        smoothed_speed = (SPEED_SMOOTHING_FACTOR * speed_mbps) + ((1.0 - SPEED_SMOOTHING_FACTOR) * last_smoothed_speed)
-                    
-                    last_smoothed_speed = smoothed_speed
-                
-                # Update UI with smoothed speed for stable display
+
+                now = time.perf_counter()
+                cur_bytes = total_bytes
+                dt = now - prev_time
+
+                if dt < 0.05 or cur_bytes <= prev_bytes:
+                    # Too little time or no new data – skip
+                    continue
+
+                instant_mbps = ((cur_bytes - prev_bytes) * 8) / dt / 1_000_000
+                prev_bytes = cur_bytes
+                prev_time = now
+
+                # Drop absurd spikes (buffer-flush artefacts)
+                if instant_mbps > MAX_REASONABLE_SPEED:
+                    continue
+
+                # Record sample only after warm-up
+                elapsed = now - start_time
+                if elapsed >= WARMUP_SECONDS:
+                    speed_samples.append(instant_mbps)
+
+                # Smooth for UI regardless of warm-up phase
+                if smoothed == 0.0:
+                    smoothed = instant_mbps
+                else:
+                    smoothed = EMA_ALPHA * instant_mbps + (1 - EMA_ALPHA) * smoothed
+
                 if self.on_progress:
-                    prog = (current_time - start_time) / self.duration_seconds
-                    self.on_progress(min(prog, 1.0), smoothed_speed)
-        
-        # Create tasks
-        worker_tasks = [asyncio.create_task(upload_worker(i)) for i in range(connections)]
-        sampler_task = asyncio.create_task(sample_speed())
-        
-        # Wait for duration
-        remaining = end_time - time.perf_counter()
-        if remaining > 0:
-            await asyncio.sleep(remaining)
-        
-        # Signal stop
-        stop_flag.set()
-        
-        # Cancel all tasks
-        for task in worker_tasks:
-            task.cancel()
-        sampler_task.cancel()
-        
-        # Wait for tasks to complete
-        await asyncio.gather(*worker_tasks, return_exceptions=True)
-        try:
-            await sampler_task
-        except (asyncio.CancelledError, RuntimeError):
-            # Task was cancelled, this is expected
-            pass
-        
-        # Collect results from shared list
+                    progress = min((now - start_time) / self.duration_seconds, 1.0)
+                    self.on_progress(progress, smoothed)
+
+        # ----------------------------------------------------------------
+        # Orchestration
+        # ----------------------------------------------------------------
+        connector = aiohttp.TCPConnector(
+            ssl=True,
+            limit=connections,
+            limit_per_host=connections,
+            force_close=False,
+            enable_cleanup_closed=True,
+        )
+        timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_read=5)
+
+        async with aiohttp.ClientSession(
+            headers=self.HEADERS,
+            connector=connector,
+            timeout=timeout,
+        ) as session:
+            workers = [
+                asyncio.create_task(_worker(session, i))
+                for i in range(connections)
+            ]
+            sampler = asyncio.create_task(_sampler())
+
+            # Sleep for the test duration
+            remaining = end_time - time.perf_counter()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+
+            # Signal everyone to stop
+            stop.set()
+
+            # Cancel workers so they don't hang on a POST
+            for t in workers:
+                t.cancel()
+            sampler.cancel()
+
+            await asyncio.gather(*workers, return_exceptions=True)
+            try:
+                await sampler
+            except (asyncio.CancelledError, RuntimeError):
+                pass
+
+        # ----------------------------------------------------------------
+        # Assemble result
+        # ----------------------------------------------------------------
         result.duration_ms = (time.perf_counter() - start_time) * 1000
-        result.bytes_total = bytes_uploaded[0]  # Read from shared list
-        result.connections = connection_stats  # Use shared list populated by workers
-        
-        # Use aggregate speed samples for consistent display (like download)
+        result.bytes_total = total_bytes
+        result.connections = conn_stats
         result.samples = speed_samples
-        result.calculate()
-        
+
+        # Prefer IQM-of-samples over raw total/duration
+        result.calculate_from_samples()
+
         return result
