@@ -1,52 +1,76 @@
 """
-WebSocket-based latency measurement module.
-Uses the Ookla Speedtest protocol for accurate ping/jitter measurement.
+WebSocket-based latency measurement using the Ookla Speedtest protocol.
+
+Protocol flow::
+
+    1. Connect to  wss://{hostname}:{port}/ws
+    2. Receive  HELLO {version}
+    3. Receive  YOURIP {ip}
+    4. Receive  CAPABILITIES ...
+    5. Send     PING {timestamp_ms}
+    6. Receive  PONG {server_timestamp}
+    7. Repeat 5-6 for the desired number of samples.
 """
+from __future__ import annotations
+
 import asyncio
 import time
-import websockets
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional
+
+import websockets
+import websockets.exceptions
+
 from .api import Server
-from .stats import LatencyStats, calculate_jitter
+from .constants import COMMON_HEADERS, DEFAULT_PING_COUNT
+from .stats import calculate_jitter
 
 
-# Constants for latency testing
-DEFAULT_PING_COUNT = 10
-DEFAULT_TIMEOUT = 5.0
-HANDSHAKE_TIMEOUT = 2.0
-MESSAGE_TIMEOUT = 0.5
-MAX_CONCURRENT_TESTS = 10
+# ---------------------------------------------------------------------------
+# Tunables
+# ---------------------------------------------------------------------------
 
+_WS_CONNECT_TIMEOUT = 5.0   # seconds to establish the WS connection
+_HANDSHAKE_TIMEOUT = 2.0     # max wait for HELLO/YOURIP/CAPABILITIES
+_MSG_TIMEOUT = 0.5           # per-message timeout during handshake
+_PING_TIMEOUT = 5.0          # per-ping round-trip timeout
+_MAX_CONCURRENT = 10         # semaphore cap for parallel server tests
+
+
+# ---------------------------------------------------------------------------
+# Result dataclasses
+# ---------------------------------------------------------------------------
 
 @dataclass
 class PingResult:
-    """Result from a single ping."""
-    latency_ms: float
-    server_timestamp: int
-    client_timestamp: float
+    """A single PING/PONG round-trip."""
+
+    latency_ms: float = 0.0
+    server_timestamp: int = 0
+    client_timestamp: float = 0.0
     success: bool = True
     error: Optional[str] = None
 
 
 @dataclass
 class ServerLatencyResult:
-    """Latency test results for a single server."""
+    """Aggregated latency data for one server."""
+
     server: Server
     external_ip: str = ""
     pings: List[float] = field(default_factory=list)
-    latency_ms: float = 0.0  # Best (min) latency
+    latency_ms: float = 0.0     # best (min) latency
     jitter_ms: float = 0.0
     success: bool = True
     error: Optional[str] = None
     server_version: str = ""
-    
-    def calculate(self):
-        """Calculate statistics from ping samples."""
+
+    def calculate(self) -> None:
+        """Derive min-latency and jitter from collected pings."""
         if self.pings:
             self.latency_ms = min(self.pings)
             self.jitter_ms = calculate_jitter(self.pings)
-    
+
     def to_dict(self) -> dict:
         return {
             "server_id": self.server.id,
@@ -57,193 +81,141 @@ class ServerLatencyResult:
             "latency_ms": round(self.latency_ms, 1),
             "jitter_ms": round(self.jitter_ms, 3),
             "success": self.success,
-            "server_version": self.server_version
+            "server_version": self.server_version,
         }
 
 
+# ---------------------------------------------------------------------------
+# Tester
+# ---------------------------------------------------------------------------
+
 class LatencyTester:
-    """
-    WebSocket-based latency tester using Ookla protocol.
-    
-    Protocol flow:
-    1. Connect to wss://{hostname}:{port}/ws
-    2. Receive: HELLO {version}
-    3. Receive: YOURIP {ip}
-    4. Receive: CAPABILITIES ...
-    5. Send: PING {timestamp}
-    6. Receive: PONG {server_timestamp}
-    7. Repeat 5-6 for desired number of samples
-    """
-    
-    WEBSOCKET_HEADERS = {
-        "Origin": "https://www.speedtest.net",
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-    }
-    
-    def __init__(self, ping_count: int = DEFAULT_PING_COUNT, timeout: float = DEFAULT_TIMEOUT):
+    """Test ping latency to one or more Ookla servers over WebSocket."""
+
+    def __init__(
+        self,
+        ping_count: int = DEFAULT_PING_COUNT,
+        timeout: float = _PING_TIMEOUT,
+    ) -> None:
         self.ping_count = ping_count
         self.timeout = timeout
-    
+
+    # -- Single server ------------------------------------------------------
+
     async def test_server(self, server: Server) -> ServerLatencyResult:
-        """Test latency to a single server."""
         result = ServerLatencyResult(server=server)
-        
+
         try:
             async with websockets.connect(
                 server.ws_url,
-                additional_headers=self.WEBSOCKET_HEADERS,
+                additional_headers=COMMON_HEADERS,
                 ping_interval=None,
                 close_timeout=2,
-                open_timeout=self.timeout
+                open_timeout=_WS_CONNECT_TIMEOUT,
             ) as ws:
-                # Read initial handshake (with short timeout)
                 await self._read_handshake(ws, result)
-                
-                # Perform ping tests
+
                 for _ in range(self.ping_count):
-                    ping_result = await self._perform_ping(ws)
-                    if ping_result.success:
-                        result.pings.append(ping_result.latency_ms)
+                    pr = await self._ping_once(ws)
+                    if pr.success:
+                        result.pings.append(pr.latency_ms)
                     else:
-                        # If ping fails, don't kill the whole test immediately, try one more time?
-                        # Or just stop.
-                        break
-                
+                        # One failure is tolerated; two in a row means stop.
+                        pr2 = await self._ping_once(ws)
+                        if pr2.success:
+                            result.pings.append(pr2.latency_ms)
+                        else:
+                            break
+
                 result.calculate()
-                
+
         except asyncio.TimeoutError:
             result.success = False
             result.error = "Connection timeout"
-        except (websockets.exceptions.WebSocketException, ConnectionError, OSError) as e:
+        except (websockets.exceptions.WebSocketException, ConnectionError, OSError) as exc:
             result.success = False
-            result.error = str(e)
-        
+            result.error = str(exc)
+
         return result
-    
-    async def _read_handshake(self, ws, result: ServerLatencyResult):
-        """Read initial handshake messages from server."""
-        # Try to read messages until we get what we want or timeout
-        # We expect HELLO, YOURIP, CAPABILITIES
-        start = time.perf_counter()
-        required_found = 0
-        
-        while time.perf_counter() - start < HANDSHAKE_TIMEOUT:  # Max 2 seconds for handshake
-            try:
-                msg = await asyncio.wait_for(ws.recv(), timeout=MESSAGE_TIMEOUT)
-                if msg.startswith("HELLO"):
-                    parts = msg.split()
-                    if len(parts) >= 2:
-                        result.server_version = parts[1]
-                elif msg.startswith("YOURIP"):
-                    result.external_ip = msg.split()[1].strip()
-                elif msg.startswith("CAPABILITIES"):
-                    pass
-                
-                # If we got at least something, we can proceed
-                required_found += 1
-                if required_found >= 3:
-                     break
-            except asyncio.TimeoutError:
-                # If we timed out waiting for handshake messages, just proceed to ping
-                # Some servers might be quiet
-                break
-            except (websockets.exceptions.WebSocketException, ConnectionError, OSError):
-                break
-    
-    async def _perform_ping(self, ws) -> PingResult:
-        """Perform a single ping measurement."""
-        # Send PING with current timestamp
-        send_time = time.perf_counter() * 1000  # Convert to ms
-        await ws.send(f"PING {send_time}")
-        
-        try:
-            # Wait for PONG
-            msg = await asyncio.wait_for(ws.recv(), timeout=self.timeout)
-            recv_time = time.perf_counter() * 1000
-            
-            if msg.startswith("PONG"):
-                latency = recv_time - send_time
-                parts = msg.split()
-                server_ts = int(parts[1]) if len(parts) > 1 else 0
-                
-                return PingResult(
-                    latency_ms=latency,
-                    server_timestamp=server_ts,
-                    client_timestamp=send_time,
-                    success=True
-                )
-            else:
-                return PingResult(
-                    latency_ms=0,
-                    server_timestamp=0,
-                    client_timestamp=send_time,
-                    success=False,
-                    error=f"Unexpected response: {msg[:50]}"
-                )
-        except asyncio.TimeoutError:
-            return PingResult(
-                latency_ms=0,
-                server_timestamp=0,
-                client_timestamp=send_time,
-                success=False,
-                error="Ping timeout"
-            )
-    
+
+    # -- Multiple servers ---------------------------------------------------
+
     async def test_servers(
         self,
         servers: List[Server],
-        concurrent: int = 1
+        concurrent: int = 1,
     ) -> List[ServerLatencyResult]:
-        """
-        Test latency to multiple servers.
-        
-        Args:
-            servers: List of servers to test
-            concurrent: Number of concurrent tests (1 for sequential)
-        
-        Returns:
-            List of ServerLatencyResult, sorted by latency
-        """
-        # Validate concurrent parameter
-        concurrent = max(1, min(concurrent, MAX_CONCURRENT_TESTS))
+        """Test *servers* and return results sorted by latency (best first)."""
+        concurrent = max(1, min(concurrent, _MAX_CONCURRENT))
+
         if concurrent == 1:
-            # Sequential testing
-            results = []
-            for server in servers:
-                result = await self.test_server(server)
-                results.append(result)
+            results = [await self.test_server(s) for s in servers]
         else:
-            # Concurrent testing with semaphore
-            semaphore = asyncio.Semaphore(concurrent)
-            
-            async def test_with_semaphore(server: Server):
-                async with semaphore:
-                    return await self.test_server(server)
-            
-            tasks = [test_with_semaphore(s) for s in servers]
-            results = await asyncio.gather(*tasks)
-        
-        # Sort by latency (successes first, then by latency)
-        results = sorted(
-            results,
-            key=lambda r: (not r.success, r.latency_ms if r.success else float('inf'))
+            sem = asyncio.Semaphore(concurrent)
+
+            async def _guarded(srv: Server) -> ServerLatencyResult:
+                async with sem:
+                    return await self.test_server(srv)
+
+            results = await asyncio.gather(*[_guarded(s) for s in servers])
+
+        results.sort(
+            key=lambda r: (not r.success, r.latency_ms if r.success else float("inf"))
         )
-        
         return results
-    
-    def select_best_servers(
-        self,
-        results: List[ServerLatencyResult],
-        count: int = 4
-    ) -> List[Server]:
-        """
-        Select the best servers based on latency results.
-        
-        Speedtest.net typically uses 4 servers for download and 1 for upload.
-        """
-        successful = [r for r in results if r.success and r.pings]
-        return [r.server for r in successful[:count]]
+
+    # -- Internals ----------------------------------------------------------
+
+    @staticmethod
+    async def _read_handshake(ws, result: ServerLatencyResult) -> None:
+        """Consume HELLO / YOURIP / CAPABILITIES messages."""
+        start = time.perf_counter()
+        received = 0
+
+        while time.perf_counter() - start < _HANDSHAKE_TIMEOUT:
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=_MSG_TIMEOUT)
+            except asyncio.TimeoutError:
+                break
+            except (websockets.exceptions.WebSocketException, ConnectionError, OSError):
+                break
+
+            if msg.startswith("HELLO"):
+                parts = msg.split()
+                if len(parts) >= 2:
+                    result.server_version = parts[1]
+            elif msg.startswith("YOURIP"):
+                result.external_ip = msg.split()[1].strip()
+
+            received += 1
+            if received >= 3:
+                break
+
+    async def _ping_once(self, ws) -> PingResult:
+        """Send PING, receive PONG, measure RTT."""
+        send_time = time.perf_counter() * 1000  # ms
+        await ws.send(f"PING {send_time}")
+
+        try:
+            msg = await asyncio.wait_for(ws.recv(), timeout=self.timeout)
+            recv_time = time.perf_counter() * 1000
+
+            if msg.startswith("PONG"):
+                parts = msg.split()
+                server_ts = int(parts[1]) if len(parts) > 1 else 0
+                return PingResult(
+                    latency_ms=recv_time - send_time,
+                    server_timestamp=server_ts,
+                    client_timestamp=send_time,
+                )
+            return PingResult(
+                success=False,
+                client_timestamp=send_time,
+                error=f"Unexpected response: {msg[:50]}",
+            )
+        except asyncio.TimeoutError:
+            return PingResult(
+                success=False,
+                client_timestamp=send_time,
+                error="Ping timeout",
+            )

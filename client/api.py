@@ -1,23 +1,29 @@
 """
-Speedtest.net API communication module.
-Handles server discovery and configuration fetching.
+Speedtest.net API client.
+
+Handles server discovery and client-info fetching.  All HTTP work goes
+through a single ``aiohttp.ClientSession`` managed via async-context-manager
+protocol (``async with SpeedtestAPI() as api: ...``).
 """
-import aiohttp
+from __future__ import annotations
+
 import re
-import json
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
-from urllib.parse import urljoin
+from typing import Any, Dict, List, Optional
+
+import aiohttp
+
+from .constants import BASE_URL, COMMON_HEADERS, SERVERS_URL
 
 
-# Speedtest.net endpoints
-BASE_URL = "https://www.speedtest.net"
-CONFIG_URL = "https://www.speedtest.net/api/js/servers"
-
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Server:
-    """Speedtest server information."""
+    """A single Ookla speedtest server."""
+
     id: int
     name: str
     sponsor: str
@@ -30,40 +36,45 @@ class Server:
     distance: float
     url: str
     https_functional: bool = True
-    
+
+    # -- Constructors -------------------------------------------------------
+
     @classmethod
-    def from_dict(cls, data: dict) -> "Server":
+    def from_dict(cls, data: dict) -> Server:
+        host_raw = data.get("host", "")
         return cls(
-            id=data.get("id", 0),
+            id=int(data.get("id", 0)),
             name=data.get("name", ""),
             sponsor=data.get("sponsor", ""),
-            hostname=data.get("hostname", data.get("host", "").split(":")[0]),
-            port=data.get("port", 8080),
+            hostname=data.get("hostname", host_raw.split(":")[0]),
+            port=int(data.get("port", 8080)),
             country=data.get("country", ""),
             cc=data.get("cc", ""),
             lat=float(data.get("lat", 0)),
             lon=float(data.get("lon", 0)),
             distance=float(data.get("distance", 0)),
             url=data.get("url", ""),
-            https_functional=bool(data.get("httpsFunctional", True))
+            https_functional=bool(data.get("httpsFunctional", True)),
         )
-    
+
+    # -- Derived URLs -------------------------------------------------------
+
     @property
     def ws_url(self) -> str:
-        """WebSocket URL for latency testing."""
+        """WebSocket endpoint for latency testing."""
         return f"wss://{self.hostname}:{self.port}/ws?"
-    
+
     @property
     def download_url(self) -> str:
-        """HTTPS URL for download testing."""
         return f"https://{self.hostname}:{self.port}/download"
-    
+
     @property
     def upload_url(self) -> str:
-        """HTTPS URL for upload testing."""
         return f"https://{self.hostname}:{self.port}/upload"
-    
-    def to_dict(self) -> dict:
+
+    # -- Serialisation ------------------------------------------------------
+
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
             "name": self.name,
@@ -74,130 +85,99 @@ class Server:
             "cc": self.cc,
             "lat": self.lat,
             "lon": self.lon,
-            "distance": self.distance
+            "distance": self.distance,
         }
 
 
 @dataclass
 class ClientInfo:
-    """Client information from Speedtest.net."""
+    """Information about the client fetched from speedtest.net."""
+
     ip: str
     isp: str
     lat: float
     lon: float
     country: str
-    
-    def to_dict(self) -> dict:
+
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "ip": self.ip,
             "isp": self.isp,
             "lat": self.lat,
             "lon": self.lon,
-            "country": self.country
+            "country": self.country,
         }
 
 
+# ---------------------------------------------------------------------------
+# API client
+# ---------------------------------------------------------------------------
+
 class SpeedtestAPI:
-    """Speedtest.net API client."""
-    
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Origin": "https://www.speedtest.net",
-        "Referer": "https://www.speedtest.net/",
-    }
-    
-    def __init__(self):
-        self.session: Optional[aiohttp.ClientSession] = None
+    """Async context-manager wrapping the Speedtest.net REST API."""
+
+    def __init__(self) -> None:
+        self._session: Optional[aiohttp.ClientSession] = None
         self.servers: List[Server] = []
         self.client_info: Optional[ClientInfo] = None
-    
-    async def __aenter__(self):
-        await self.connect()
+
+    # -- Context manager ----------------------------------------------------
+
+    async def __aenter__(self) -> SpeedtestAPI:
+        self._session = aiohttp.ClientSession(headers=COMMON_HEADERS)
         return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.close()
-    
-    async def connect(self):
-        """Create aiohttp session."""
-        self.session = aiohttp.ClientSession(headers=self.HEADERS)
-    
-    async def close(self):
-        """Close aiohttp session."""
-        if self.session:
-            await self.session.close()
-            self.session = None
-    
-    async def fetch_config(self) -> Dict[str, Any]:
-        """Fetch configuration from Speedtest.net main page."""
-        async with self.session.get(BASE_URL) as response:
-            html = await response.text()
-        
-        # Extract embedded config from HTML
-        config = {}
-        
-        # Try to find IP and ISP info
-        ip_match = re.search(r'"ipAddress"\s*:\s*"([^"]+)"', html)
-        isp_match = re.search(r'"ispName"\s*:\s*"([^"]+)"', html)
-        lat_match = re.search(r'"latitude"\s*:\s*([\d.]+)', html)
-        lon_match = re.search(r'"longitude"\s*:\s*([\d.]+)', html)
-        country_match = re.search(r'"countryCode"\s*:\s*"([^"]+)"', html)
-        
-        if ip_match:
-            config["ip"] = ip_match.group(1)
-        if isp_match:
-            config["isp"] = isp_match.group(1)
-        if lat_match:
-            config["lat"] = float(lat_match.group(1))
-        if lon_match:
-            config["lon"] = float(lon_match.group(1))
-        if country_match:
-            config["country"] = country_match.group(1)
-        
-        return config
-    
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:  # noqa: ANN001
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+    # -- Internal helpers ---------------------------------------------------
+
+    def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None:
+            raise RuntimeError(
+                "SpeedtestAPI must be used as an async context manager "
+                "(async with SpeedtestAPI() as api: ...)"
+            )
+        return self._session
+
+    # -- Public methods -----------------------------------------------------
+
+    async def get_client_info(self) -> ClientInfo:
+        """Scrape client IP / ISP / location from the speedtest.net home page."""
+        session = self._ensure_session()
+
+        async with session.get(BASE_URL) as resp:
+            resp.raise_for_status()
+            html = await resp.text()
+
+        def _extract(pattern: str) -> str:
+            m = re.search(pattern, html)
+            return m.group(1) if m else ""
+
+        self.client_info = ClientInfo(
+            ip=_extract(r'"ipAddress"\s*:\s*"([^"]+)"'),
+            isp=_extract(r'"ispName"\s*:\s*"([^"]+)"'),
+            lat=float(_extract(r'"latitude"\s*:\s*([\d.]+)') or 0),
+            lon=float(_extract(r'"longitude"\s*:\s*([\d.]+)') or 0),
+            country=_extract(r'"countryCode"\s*:\s*"([^"]+)"'),
+        )
+        return self.client_info
+
     async def fetch_servers(self, limit: int = 10) -> List[Server]:
-        """Fetch nearby speedtest servers."""
+        """Return up to *limit* nearby servers, sorted by distance."""
+        session = self._ensure_session()
+
         params = {
             "engine": "js",
             "https_functional": "true",
-            "limit": str(limit)
+            "limit": str(limit),
         }
-        
-        async with self.session.get(CONFIG_URL, params=params) as response:
-            data = await response.json()
-        
+
+        async with session.get(SERVERS_URL, params=params) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
         self.servers = [Server.from_dict(s) for s in data]
         return self.servers
-    
-    async def get_client_info(self) -> ClientInfo:
-        """Get client information."""
-        config = await self.fetch_config()
-        
-        self.client_info = ClientInfo(
-            ip=config.get("ip", ""),
-            isp=config.get("isp", ""),
-            lat=config.get("lat", 0.0),
-            lon=config.get("lon", 0.0),
-            country=config.get("country", "")
-        )
-        
-        return self.client_info
-    
-    async def select_best_server(self, servers: List[Server] = None) -> Server:
-        """
-        Select the best server based on latency.
-        This should be called after latency tests are performed.
-        """
-        if servers is None:
-            servers = self.servers
-        
-        if not servers:
-            raise ValueError("No servers available")
-        
-        # For now, return the first (closest by distance) server
-        # The actual selection will be done after latency testing
-        return servers[0]

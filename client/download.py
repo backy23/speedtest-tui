@@ -1,248 +1,246 @@
 """
 Download speed test module.
-Uses parallel HTTPS connections to measure download speed.
+
+Uses parallel HTTPS GET streams against an Ookla server.  Design mirrors
+the upload module: shared session, warm-up discard, IQM-based final speed,
+and EMA-smoothed progress callback.
 """
+from __future__ import annotations
+
 import asyncio
+import statistics
 import time
-import aiohttp
 from dataclasses import dataclass, field
-from typing import List, Optional, Callable
+from typing import Callable, List, Optional
+
+import aiohttp
+
 from .api import Server
-from .stats import SpeedStats, ConnectionStats, LatencyStats
+from .constants import (
+    CHUNK_SIZE,
+    COMMON_HEADERS,
+    DOWNLOAD_FILE_SIZE,
+    EMA_ALPHA,
+    MAX_CONNECTIONS,
+    MAX_REASONABLE_SPEED,
+    MIN_CONNECTIONS,
+    SAMPLE_INTERVAL,
+    WARMUP_SECONDS,
+)
+from .stats import ConnectionStats, LatencyStats
 
 
-# Constants for download testing
-DOWNLOAD_CHUNK_SIZE = 256 * 1024  # 256KB chunks for better TCP window utilization
-DOWNLOAD_FILE_SIZE = 50 * 1000 * 1000  # 50MB file size
-SAMPLE_INTERVAL = 0.1  # 100ms sampling interval for accurate jitter calculation
-MAX_CONNECTIONS = 32  # Maximum allowed concurrent connections
-MIN_CONNECTIONS = 1   # Minimum allowed concurrent connections
-
+# ---------------------------------------------------------------------------
+# Result
+# ---------------------------------------------------------------------------
 
 @dataclass
 class DownloadResult:
     """Download test result."""
+
     speed_bps: float = 0.0
     speed_mbps: float = 0.0
     bytes_total: int = 0
     duration_ms: float = 0.0
     connections: List[ConnectionStats] = field(default_factory=list)
     loaded_latency: Optional[LatencyStats] = None
-    samples: List[float] = field(default_factory=list)  # Speed samples over time
-    
-    def calculate(self):
-        """Calculate final speed."""
+    samples: List[float] = field(default_factory=list)
+
+    def calculate(self) -> None:
+        """Derive speed from total bytes and wall-clock duration."""
         if self.duration_ms > 0:
             self.speed_bps = (self.bytes_total * 8) / (self.duration_ms / 1000)
             self.speed_mbps = self.speed_bps / 1_000_000
-    
+
+    def calculate_from_samples(self) -> None:
+        """Use interquartile mean of speed samples for a more stable result."""
+        if not self.samples:
+            self.calculate()
+            return
+
+        trimmed = _iqm(self.samples)
+        if trimmed > 0:
+            self.speed_mbps = trimmed
+            self.speed_bps = trimmed * 1_000_000
+
     def to_dict(self) -> dict:
-        result = {
+        result: dict = {
             "speed_bps": round(self.speed_bps, 2),
             "speed_mbps": round(self.speed_mbps, 2),
             "bytes_total": self.bytes_total,
             "duration_ms": round(self.duration_ms, 2),
             "connections": [c.to_dict() for c in self.connections],
-            "samples": [round(s, 2) for s in self.samples]
+            "samples": [round(s, 2) for s in self.samples],
         }
         if self.loaded_latency:
             result["loaded_latency"] = self.loaded_latency.to_dict()
         return result
 
 
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+def _iqm(samples: List[float]) -> float:
+    if not samples:
+        return 0.0
+    if len(samples) < 4:
+        return statistics.mean(samples)
+    ordered = sorted(samples)
+    n = len(ordered)
+    return statistics.mean(ordered[n // 4 : (3 * n) // 4]) or statistics.mean(samples)
+
+
+# ---------------------------------------------------------------------------
+# Tester
+# ---------------------------------------------------------------------------
+
 class DownloadTester:
     """
     Parallel download speed tester.
-    Legacy implementation maintained for compatibility.
-    """
-    def __init__(self, duration_seconds: float = 15.0, connections_per_server: int = 4, chunk_size: int = DOWNLOAD_CHUNK_SIZE):
-        self.duration_seconds = duration_seconds
-        self.connections_per_server = connections_per_server
-        self.chunk_size = chunk_size
-        self.on_progress = None
 
-    async def test(self, servers: List[Server], max_connections: int = 8) -> DownloadResult:
-        # Redirect to SimpleDownloadTester logic for now as it is more robust
-        simple = SimpleDownloadTester(self.duration_seconds)
-        simple.on_progress = self.on_progress
-        if servers:
-            return await simple.test(servers[0], max_connections)
-        return DownloadResult()
-
-
-class SimpleDownloadTester:
+    Each worker opens a long-running GET request and reads ``CHUNK_SIZE``
+    chunks in a loop.  A sampler coroutine records throughput every
+    ``SAMPLE_INTERVAL`` seconds, discarding the first ``WARMUP_SECONDS``.
+    The final speed is the IQM of the post-warmup samples.
     """
-    Simplified download tester for faster results.
-    Uses fewer connections and shorter duration.
-    Optimized for strict timeout handling.
-    """
-    
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
-        "Origin": "https://www.speedtest.net",
-        "Referer": "https://www.speedtest.net/",
-    }
-    
-    def __init__(self, duration_seconds: float = 10.0):
+
+    def __init__(self, duration_seconds: float = 10.0) -> None:
         self.duration_seconds = duration_seconds
         self.on_progress: Optional[Callable[[float, float], None]] = None
-    
+
     async def test(self, server: Server, connections: int = 4) -> DownloadResult:
-        """Perform download test on a single server."""
-        # Validate connection count
         connections = max(MIN_CONNECTIONS, min(connections, MAX_CONNECTIONS))
-        
+
         result = DownloadResult()
-        
-        bytes_downloaded = 0
-        speed_samples = []
+        total_bytes = 0
+        speed_samples: List[float] = []
+        conn_stats: List[ConnectionStats] = []
+
         start_time = time.perf_counter()
         end_time = start_time + self.duration_seconds
-        stop_flag = asyncio.Event()
-        
-        async def download_worker(conn_id: int) -> ConnectionStats:
-            nonlocal bytes_downloaded
-            
-            stats = ConnectionStats(
-                id=conn_id,
-                server_id=server.id,
-                hostname=server.hostname
-            )
-            
-            conn_start = time.perf_counter()
-            # Stricter timeouts: connect in 5s, read in 5s (but we read chunks so it should be fast)
-            timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_read=5)
-            
-            try:
-                # Use connection pooling with force_close=False for better performance
-                connector = aiohttp.TCPConnector(
-                    ssl=True,
-                    force_close=False,
-                    limit=1,
-                    limit_per_host=1,
-                    enable_cleanup_closed=True
-                )
-                async with aiohttp.ClientSession(
-                    headers=self.HEADERS,
-                    connector=connector,
-                    timeout=timeout
-                ) as session:
-                    while not stop_flag.is_set() and time.perf_counter() < end_time:
-                        try:
-                            url = f"{server.download_url}?size={DOWNLOAD_FILE_SIZE}"  # Use constant
-                            async with session.get(url) as response:
-                                while not stop_flag.is_set():
-                                    try:
-                                        if stop_flag.is_set() or time.perf_counter() >= end_time:
-                                            break
-                                            
-                                        # Use wait_for to allow cancellation during potentially slow reads
-                                        # Read larger chunks (256KB) for better TCP window utilization
-                                        chunk = await asyncio.wait_for(response.content.read(DOWNLOAD_CHUNK_SIZE), timeout=0.5)
-                                        if not chunk:
-                                            break
-                                        
-                                        chunk_size = len(chunk)
-                                        stats.bytes_transferred += chunk_size
-                                        bytes_downloaded += chunk_size
-                                        
-                                    except asyncio.TimeoutError:
-                                        # Just a check for end_time/stop_flag
-                                        continue
-                                    except aiohttp.ClientPayloadError as e:
-                                        # Payload error, break out of inner loop
-                                        break
-                                    except (aiohttp.ClientError, OSError) as e:
-                                        # Connection error, break out of inner loop
-                                        break
-                        except asyncio.CancelledError:
-                            break
-                        except (aiohttp.ClientError, OSError) as e:
-                            # Connection error, retry if time permits
-                            if stop_flag.is_set():
-                                break
-                            await asyncio.sleep(0.1)
-            except asyncio.CancelledError:
-                pass
-            except (aiohttp.ClientError, OSError) as e:
-                # Connection-level error, stats will be incomplete
-                pass
-            
-            stats.duration_ms = (time.perf_counter() - conn_start) * 1000
-            stats.calculate()
-            return stats
-        
-        async def sample_speed():
-            nonlocal bytes_downloaded
-            last_bytes = 0
-            last_time = start_time
-            smoothed_speed = 0.0  # For stable UI display
-            SMOOTHING_FACTOR = 0.3  # 30% new, 70% old for smooth display
-            
-            while not stop_flag.is_set() and time.perf_counter() < end_time:
+        stop = asyncio.Event()
+
+        # -- Worker ---------------------------------------------------------
+
+        async def _worker(session: aiohttp.ClientSession, cid: int) -> None:
+            nonlocal total_bytes
+
+            stats = ConnectionStats(id=cid, server_id=server.id, hostname=server.hostname)
+            conn_stats.append(stats)
+            t0 = time.perf_counter()
+
+            while not stop.is_set() and time.perf_counter() < end_time:
                 try:
-                    await asyncio.wait_for(stop_flag.wait(), timeout=SAMPLE_INTERVAL)
-                    # If we woke up because stop_flag is set, loop checks and exits
+                    url = f"{server.download_url}?size={DOWNLOAD_FILE_SIZE}"
+                    async with session.get(url) as resp:
+                        while not stop.is_set():
+                            if time.perf_counter() >= end_time:
+                                break
+                            try:
+                                chunk = await asyncio.wait_for(
+                                    resp.content.read(CHUNK_SIZE),
+                                    timeout=1.0,
+                                )
+                            except asyncio.TimeoutError:
+                                continue
+                            if not chunk:
+                                break
+
+                            n = len(chunk)
+                            stats.bytes_transferred += n
+                            total_bytes += n
+
+                except asyncio.CancelledError:
+                    break
+                except (aiohttp.ClientError, aiohttp.ClientPayloadError, OSError):
+                    if stop.is_set():
+                        break
+                    await asyncio.sleep(0.2)
+
+            stats.duration_ms = (time.perf_counter() - t0) * 1000
+            stats.calculate()
+
+        # -- Sampler --------------------------------------------------------
+
+        async def _sampler() -> None:
+            prev_bytes = 0
+            prev_time = start_time
+            smoothed = 0.0
+
+            while not stop.is_set() and time.perf_counter() < end_time:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=SAMPLE_INTERVAL)
+                    break
                 except asyncio.TimeoutError:
-                    # Timeout means SAMPLE_INTERVAL passed, time to sample
                     pass
-                
-                current_time = time.perf_counter()
-                current_bytes = bytes_downloaded
-                
-                elapsed = current_time - last_time
-                if elapsed > 0:
-                    speed_mbps = ((current_bytes - last_bytes) * 8) / elapsed / 1_000_000
-                    speed_samples.append(speed_mbps)
-                    
-                    # Apply exponential smoothing for stable UI display
-                    if smoothed_speed == 0.0:
-                        smoothed_speed = speed_mbps
-                    else:
-                        smoothed_speed = (SMOOTHING_FACTOR * speed_mbps) + ((1.0 - SMOOTHING_FACTOR) * smoothed_speed)
-                    
-                    if self.on_progress:
-                        prog = (current_time - start_time) / self.duration_seconds
-                        self.on_progress(min(prog, 1.0), smoothed_speed)
-                
-                last_bytes = current_bytes
-                last_time = current_time
-        
-        # Create tasks
-        worker_tasks = [asyncio.create_task(download_worker(i)) for i in range(connections)]
-        sampler_task = asyncio.create_task(sample_speed())
-        
-        # Wait for duration
-        remaining = end_time - time.perf_counter()
-        if remaining > 0:
-            await asyncio.sleep(remaining)
-        
-        # Signal stop
-        stop_flag.set()
-        
-        # Cancel all tasks
-        for task in worker_tasks:
-            task.cancel()
-        sampler_task.cancel()
-        
-        # Wait for tasks to complete cleanly
-        results = await asyncio.gather(*worker_tasks, return_exceptions=True)
-        try:
-            await sampler_task
-        except:
-            pass
-        
-        connection_stats = []
-        for r in results:
-            if isinstance(r, ConnectionStats):
-                connection_stats.append(r)
-        
+
+                now = time.perf_counter()
+                cur = total_bytes
+                dt = now - prev_time
+
+                if dt < 0.05 or cur <= prev_bytes:
+                    continue
+
+                mbps = ((cur - prev_bytes) * 8) / dt / 1_000_000
+                prev_bytes = cur
+                prev_time = now
+
+                if mbps > MAX_REASONABLE_SPEED:
+                    continue
+
+                if now - start_time >= WARMUP_SECONDS:
+                    speed_samples.append(mbps)
+
+                smoothed = (
+                    mbps if smoothed == 0.0
+                    else EMA_ALPHA * mbps + (1 - EMA_ALPHA) * smoothed
+                )
+
+                if self.on_progress:
+                    prog = min((now - start_time) / self.duration_seconds, 1.0)
+                    self.on_progress(prog, smoothed)
+
+        # -- Orchestration --------------------------------------------------
+
+        connector = aiohttp.TCPConnector(
+            ssl=True,
+            limit=connections,
+            limit_per_host=connections,
+            force_close=False,
+            enable_cleanup_closed=True,
+        )
+        timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_read=5)
+        headers = {**COMMON_HEADERS, "Accept-Encoding": "identity"}
+
+        async with aiohttp.ClientSession(
+            headers=headers,
+            connector=connector,
+            timeout=timeout,
+        ) as session:
+            workers = [asyncio.create_task(_worker(session, i)) for i in range(connections)]
+            sampler = asyncio.create_task(_sampler())
+
+            remaining = end_time - time.perf_counter()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+
+            stop.set()
+
+            for t in workers:
+                t.cancel()
+            sampler.cancel()
+
+            await asyncio.gather(*workers, return_exceptions=True)
+            try:
+                await sampler
+            except (asyncio.CancelledError, RuntimeError):
+                pass
+
         result.duration_ms = (time.perf_counter() - start_time) * 1000
-        result.bytes_total = bytes_downloaded
-        result.connections = connection_stats
+        result.bytes_total = total_bytes
+        result.connections = conn_stats
         result.samples = speed_samples
-        result.calculate()
-        
+        result.calculate_from_samples()
+
         return result

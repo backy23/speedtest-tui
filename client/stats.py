@@ -1,28 +1,36 @@
 """
-Statistics module for calculating network metrics.
+Network measurement statistics.
+
+Pure functions and lightweight dataclasses -- no I/O, no side effects.
+Everything here is deterministic and easy to unit-test.
 """
+from __future__ import annotations
+
+import statistics
 from dataclasses import dataclass, field
 from typing import List
-import statistics
 
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
 
 @dataclass
 class LatencyStats:
-    """Latency statistics container."""
+    """Aggregated latency statistics computed from a list of samples."""
+
     samples: List[float] = field(default_factory=list)
     min: float = 0.0
     max: float = 0.0
     mean: float = 0.0
     median: float = 0.0
-    iqm: float = 0.0  # Interquartile mean
+    iqm: float = 0.0
     jitter: float = 0.0
     count: int = 0
-    
-    def calculate(self):
-        """Calculate all statistics from samples."""
+
+    def calculate(self) -> None:
         if not self.samples:
             return
-        
         self.count = len(self.samples)
         self.min = min(self.samples)
         self.max = max(self.samples)
@@ -30,142 +38,127 @@ class LatencyStats:
         self.median = statistics.median(self.samples)
         self.iqm = calculate_iqm(self.samples)
         self.jitter = calculate_jitter(self.samples)
-    
+
     def to_dict(self) -> dict:
         return {
-            "samples": self.samples,
+            "samples": [round(s, 3) for s in self.samples],
             "min": round(self.min, 3),
             "max": round(self.max, 3),
             "mean": round(self.mean, 3),
             "median": round(self.median, 3),
             "iqm": round(self.iqm, 3),
             "jitter": round(self.jitter, 3),
-            "count": self.count
+            "count": self.count,
         }
 
 
 @dataclass
 class SpeedStats:
-    """Speed test statistics container."""
+    """Aggregated speed statistics."""
+
     bytes_transferred: int = 0
     duration_ms: float = 0.0
-    speed_bps: float = 0.0  # bits per second
-    speed_mbps: float = 0.0  # megabits per second
-    samples: List[float] = field(default_factory=list)  # speed samples over time
-    
-    def calculate(self):
-        """Calculate speed from bytes and duration."""
+    speed_bps: float = 0.0
+    speed_mbps: float = 0.0
+    samples: List[float] = field(default_factory=list)
+
+    def calculate(self) -> None:
         if self.duration_ms > 0:
             self.speed_bps = (self.bytes_transferred * 8) / (self.duration_ms / 1000)
             self.speed_mbps = self.speed_bps / 1_000_000
-    
+
     def to_dict(self) -> dict:
         return {
             "bytes": self.bytes_transferred,
             "duration_ms": round(self.duration_ms, 2),
             "speed_bps": round(self.speed_bps, 2),
             "speed_mbps": round(self.speed_mbps, 2),
-            "samples": [round(s, 2) for s in self.samples]
+            "samples": [round(s, 2) for s in self.samples],
         }
 
 
 @dataclass
 class ConnectionStats:
-    """Per-connection statistics."""
+    """Per-connection statistics collected by download / upload workers."""
+
     id: int = 0
     server_id: int = 0
     hostname: str = ""
     bytes_transferred: int = 0
     duration_ms: float = 0.0
     speed_mbps: float = 0.0
-    speed_samples: List[float] = field(default_factory=list)  # Per-connection speed samples for aggregation
-    
-    def calculate(self):
+
+    def calculate(self) -> None:
         if self.duration_ms > 0:
-            self.speed_mbps = (self.bytes_transferred * 8) / (self.duration_ms / 1000) / 1_000_000
-    
+            self.speed_mbps = (
+                (self.bytes_transferred * 8) / (self.duration_ms / 1000) / 1_000_000
+            )
+
     def to_dict(self) -> dict:
-        result = {
+        return {
             "id": self.id,
             "server_id": self.server_id,
             "hostname": self.hostname,
             "bytes": self.bytes_transferred,
             "duration_ms": round(self.duration_ms, 2),
-            "speed_mbps": round(self.speed_mbps, 2)
+            "speed_mbps": round(self.speed_mbps, 2),
         }
-        # Only include speed_samples if non-empty
-        if self.speed_samples:
-            result["speed_samples"] = [round(s, 2) for s in self.speed_samples]
-        return result
 
+
+# ---------------------------------------------------------------------------
+# Pure helper functions
+# ---------------------------------------------------------------------------
 
 def calculate_jitter(samples: List[float]) -> float:
-    """
-    Calculate jitter as mean absolute difference between consecutive samples.
-    This is how Ookla calculates jitter.
-    """
+    """Mean absolute difference between consecutive samples (Ookla method)."""
     if len(samples) < 2:
         return 0.0
-    
-    differences = []
-    for i in range(1, len(samples)):
-        differences.append(abs(samples[i] - samples[i-1]))
-    
-    return statistics.mean(differences)
+    diffs = [abs(samples[i] - samples[i - 1]) for i in range(1, len(samples))]
+    return statistics.mean(diffs)
 
 
 def calculate_iqm(samples: List[float]) -> float:
-    """
-    Calculate Interquartile Mean (IQM).
-    Mean of values between 25th and 75th percentile.
-    """
+    """Interquartile mean -- mean of values between Q1 and Q3."""
+    if not samples:
+        return 0.0
     if len(samples) < 4:
-        return statistics.mean(samples) if samples else 0.0
-    
-    sorted_samples = sorted(samples)
-    n = len(sorted_samples)
-    q1_idx = n // 4
-    q3_idx = (3 * n) // 4
-    
-    iqr_samples = sorted_samples[q1_idx:q3_idx]
-    return statistics.mean(iqr_samples) if iqr_samples else 0.0
+        return statistics.mean(samples)
+
+    ordered = sorted(samples)
+    n = len(ordered)
+    q1 = n // 4
+    q3 = (3 * n) // 4
+    middle = ordered[q1:q3]
+    return statistics.mean(middle) if middle else statistics.mean(samples)
 
 
 def calculate_percentile(samples: List[float], percentile: float) -> float:
-    """Calculate the given percentile of samples."""
+    """Linear-interpolation percentile."""
     if not samples:
         return 0.0
-    
-    sorted_samples = sorted(samples)
-    n = len(sorted_samples)
+
+    ordered = sorted(samples)
+    n = len(ordered)
     idx = (percentile / 100) * (n - 1)
-    
     lower = int(idx)
-    upper = lower + 1
-    
-    if upper >= n:
-        return sorted_samples[-1]
-    
-    # Linear interpolation
+    upper = min(lower + 1, n - 1)
     weight = idx - lower
-    return sorted_samples[lower] * (1 - weight) + sorted_samples[upper] * weight
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
 
 
-def format_speed(speed_bps: float) -> str:
-    """Format speed in human-readable format."""
-    if speed_bps >= 1_000_000_000:
-        return f"{speed_bps / 1_000_000_000:.2f} Gbps"
-    elif speed_bps >= 1_000_000:
-        return f"{speed_bps / 1_000_000:.2f} Mbps"
-    elif speed_bps >= 1_000:
-        return f"{speed_bps / 1_000:.2f} Kbps"
-    else:
-        return f"{speed_bps:.2f} bps"
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+def format_speed(speed_mbps: float) -> str:
+    """Human-readable speed string."""
+    if speed_mbps >= 1000:
+        return f"{speed_mbps / 1000:.2f} Gbps"
+    return f"{speed_mbps:.2f} Mbps"
 
 
 def format_latency(latency_ms: float) -> str:
-    """Format latency in human-readable format."""
+    """Human-readable latency string."""
     if latency_ms >= 1000:
         return f"{latency_ms / 1000:.2f} s"
-    else:
-        return f"{latency_ms:.1f} ms"
+    return f"{latency_ms:.1f} ms"
